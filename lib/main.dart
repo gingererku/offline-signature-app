@@ -19,6 +19,7 @@ class OfflineSignatureApp extends StatefulWidget {
 
 class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
   ClassificationModel? _model;
+  String? _loadError;
   final List<File?> _refImages = [null, null, null];
   final List<List<double>?> _refEmbeddings = [null, null, null];
   File? _testImage;
@@ -28,7 +29,6 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
   double? _accuracyPct;
   bool? _isSamePerson;
 
-  // حد التشابه المعتمد (0.89 مثالي لكاميرا الموبايل)
   final double _threshold = 0.89;
 
   @override
@@ -38,16 +38,24 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
   }
 
   Future<void> _loadModel() async {
-    _model = await PytorchLite.loadClassificationModel(
-      "assets/signature_mobile.ptl",
-      224,
-      224,
-      128,
-    );
-    setState(() {});
+    try {
+      _model = await PytorchLite.loadClassificationModel(
+        "assets/signature_mobile.ptl",
+        224,
+        224,
+        128,
+        labelPath: "assets/labels.txt",
+      );
+      if (mounted) setState(() {});
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _loadError = e.toString();
+        });
+      }
+    }
   }
 
-  // معالجة الصورة أوفلاين (عزل الخلفية + قص الإمضاء + 224x224)
   Future<Uint8List> _preprocess(File file) async {
     final bytes = await file.readAsBytes();
     img.Image? decoded = img.decodeImage(bytes);
@@ -112,7 +120,6 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
     return dot;
   }
 
-  // ميزة الـ 3 درجات: التحقق الفوري أثناء تسجيل الإمضاءات الثلاثة
   Future<void> _captureReference(int index) async {
     if (_model == null || _isBusy) return;
     if (index > 0 && _refEmbeddings[index - 1] == null) {
@@ -124,41 +131,44 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
     if (picked == null) return;
 
     setState(() => _isBusy = true);
-    File file = File(picked.path);
-    List<double> newEmb = await _getEmbedding(file);
+    try {
+      File file = File(picked.path);
+      List<double> newEmb = await _getEmbedding(file);
 
-    // إذا كان الإمضاء الثاني أو الثالث: قارنه بالسابقين فوراً
-    if (index > 0) {
-      List<List<double>> prevEmbs = [];
-      for (int i = 0; i < index; i++) {
-        prevEmbs.add(_refEmbeddings[i]!);
-      }
-      List<double> meanPrev = List.generate(
-        newEmb.length,
-        (j) => prevEmbs.map((e) => e[j]).reduce((a, b) => a + b) / prevEmbs.length,
-      );
-      meanPrev = _l2Normalize(meanPrev);
-
-      double sim = _cosineSim(meanPrev, newEmb);
-      if (sim < _threshold) {
-        setState(() => _isBusy = false);
-        _showAlert(
-          "⚠️ إمضاء غير متطابق!",
-          "هذه الإمضاءة لا تشبه الإمضاءات السابقة!\nيرجى إعادة المحاولة وتوقيع إمضاءة مطابقة.",
+      if (index > 0) {
+        List<List<double>> prevEmbs = [];
+        for (int i = 0; i < index; i++) {
+          prevEmbs.add(_refEmbeddings[i]!);
+        }
+        List<double> meanPrev = List.generate(
+          newEmb.length,
+          (j) => prevEmbs.map((e) => e[j]).reduce((a, b) => a + b) / prevEmbs.length,
         );
-        return; // يرفض حفظ الصورة ويطلب إعادتها
-      }
-    }
+        meanPrev = _l2Normalize(meanPrev);
 
-    setState(() {
-      _refImages[index] = file;
-      _refEmbeddings[index] = newEmb;
-      _accuracyPct = null;
-      _isBusy = false;
-    });
+        double sim = _cosineSim(meanPrev, newEmb);
+        if (sim < _threshold) {
+          setState(() => _isBusy = false);
+          _showAlert(
+            "⚠️ إمضاء غير متطابق!",
+            "هذه الإمضاءة لا تشبه الإمضاءات السابقة!\nيرجى إعادة المحاولة وتوقيع إمضاءة مطابقة.",
+          );
+          return;
+        }
+      }
+
+      setState(() {
+        _refImages[index] = file;
+        _refEmbeddings[index] = newEmb;
+        _accuracyPct = null;
+        _isBusy = false;
+      });
+    } catch (e) {
+      setState(() => _isBusy = false);
+      _showAlert("خطأ أثناء المعالجة", e.toString());
+    }
   }
 
-  // تصوير الإمضاء الرابع للاختبار
   Future<void> _captureTest() async {
     if (_refEmbeddings.contains(null)) {
       _showAlert("تنبيه", "أكمل تسجيل الإمضاءات المرجعية الثلاثة أولاً.");
@@ -173,26 +183,30 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
     });
   }
 
-  // التحقق النهائي
   Future<void> _verifyFinal() async {
     if (_testImage == null || _refEmbeddings.contains(null)) return;
     setState(() => _isBusy = true);
 
-    List<double> testEmb = await _getEmbedding(_testImage!);
-    List<double> meanRef = List.generate(
-      testEmb.length,
-      (j) => (_refEmbeddings[0]![j] + _refEmbeddings[1]![j] + _refEmbeddings[2]![j]) / 3.0,
-    );
-    meanRef = _l2Normalize(meanRef);
+    try {
+      List<double> testEmb = await _getEmbedding(_testImage!);
+      List<double> meanRef = List.generate(
+        testEmb.length,
+        (j) => (_refEmbeddings[0]![j] + _refEmbeddings[1]![j] + _refEmbeddings[2]![j]) / 3.0,
+      );
+      meanRef = _l2Normalize(meanRef);
 
-    double rawSim = _cosineSim(meanRef, testEmb);
-    double score = (((rawSim - 0.70) / 0.30) * 100).clamp(0.0, 100.0);
+      double rawSim = _cosineSim(meanRef, testEmb);
+      double score = (((rawSim - 0.70) / 0.30) * 100).clamp(0.0, 100.0);
 
-    setState(() {
-      _accuracyPct = score;
-      _isSamePerson = rawSim >= _threshold;
-      _isBusy = false;
-    });
+      setState(() {
+        _accuracyPct = score;
+        _isSamePerson = rawSim >= _threshold;
+        _isBusy = false;
+      });
+    } catch (e) {
+      setState(() => _isBusy = false);
+      _showAlert("خطأ أثناء التحقق", e.toString());
+    }
   }
 
   void _resetAll() {
@@ -213,7 +227,7 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
         title: Text(title, style: const TextStyle(color: Colors.red, fontWeight: FontWeight.bold)),
         content: Text(msg, style: const TextStyle(fontSize: 16)),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text("حسناً، سأعيد التوقيع")),
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text("حسناً")),
         ],
       ),
     );
@@ -235,6 +249,24 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
+            if (_loadError != null)
+              Container(
+                padding: const EdgeInsets.all(12),
+                margin: const EdgeInsets.only(bottom: 12),
+                color: Colors.red.shade100,
+                child: Text("خطأ في تحميل الموديل:\n$_loadError", style: const TextStyle(color: Colors.red)),
+              ),
+            if (_model == null && _loadError == null)
+              const Padding(
+                padding: EdgeInsets.only(bottom: 12),
+                child: Row(
+                  children: [
+                    SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)),
+                    SizedBox(width: 10),
+                    Text("جاري تهيئة نموذج الذكاء الاصطناعي..."),
+                  ],
+                ),
+              ),
             const Text("1️⃣ تسجيل 3 إمضاءات متطابقة (المرجع):", style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
             const SizedBox(height: 10),
             Row(
