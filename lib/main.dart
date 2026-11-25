@@ -20,16 +20,19 @@ class OfflineSignatureApp extends StatefulWidget {
 class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
   ClassificationModel? _model;
   String? _loadError;
-  final List<File?> _refImages = [null, null, null];
+  final List<Uint8List?> _refProcessed = [null, null, null];
   final List<List<double>?> _refEmbeddings = [null, null, null];
-  File? _testImage;
+  Uint8List? _testProcessed;
+  File? _testRawFile;
 
   final ImagePicker _picker = ImagePicker();
   bool _isBusy = false;
   double? _accuracyPct;
+  double? _rawSimValue;
   bool? _isSamePerson;
 
-  final double _threshold = 0.89;
+  // عتبة قابلة للتعديل مباشرة من التطبيق (افتراضياً 0.96)
+  double _threshold = 0.96;
 
   @override
   void initState() {
@@ -48,11 +51,7 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
       );
       if (mounted) setState(() {});
     } catch (e) {
-      if (mounted) {
-        setState(() {
-          _loadError = e.toString();
-        });
-      }
+      if (mounted) setState(() => _loadError = e.toString());
     }
   }
 
@@ -62,13 +61,27 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
     if (decoded == null) throw Exception("Invalid image");
 
     decoded = img.bakeOrientation(decoded);
+
+    // 1. قص 12% من الحواف لتجاهل أطراف الورقة والظل الجانبي
+    int marginX = (decoded.width * 0.12).toInt();
+    int marginY = (decoded.height * 0.12).toInt();
+    decoded = img.copyCrop(
+      decoded,
+      x: marginX,
+      y: marginY,
+      width: decoded.width - 2 * marginX,
+      height: decoded.height - 2 * marginY,
+    );
+
     img.Image gray = img.grayscale(decoded);
 
+    // 2. حساب متوسط الإضاءة وعزل الحبر الغامق فقط (تجاهل الظلال الخفيفة)
     int sum = 0;
     for (var p in gray) {
       sum += p.r.toInt();
     }
-    int thresh = ((sum / (gray.width * gray.height)) * 0.78).toInt();
+    int meanVal = (sum / (gray.width * gray.height)).toInt();
+    int thresh = (meanVal * 0.68).toInt();
 
     int minX = gray.width, minY = gray.height, maxX = 0, maxY = 0;
     bool found = false;
@@ -77,30 +90,35 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
       for (int x = 0; x < gray.width; x++) {
         int val = gray.getPixel(x, y).r.toInt();
         if (val < thresh) {
-          gray.setPixelRgb(x, y, 255, 255, 255);
+          gray.setPixelRgb(x, y, 255, 255, 255); // خط الإمضاء أبيض
           if (x < minX) minX = x;
           if (x > maxX) maxX = x;
           if (y < minY) minY = y;
           if (y > maxY) maxY = y;
           found = true;
         } else {
-          gray.setPixelRgb(x, y, 0, 0, 0);
+          gray.setPixelRgb(x, y, 0, 0, 0); // الخلفية سوداء
         }
       }
     }
 
-    if (found && maxX > minX && maxY > minY) {
-      gray = img.copyCrop(gray, x: minX, y: minY, width: maxX - minX, height: maxY - minY);
+    // 3. قص الإمضاء بدقة مع هامش أمان بسيط (10 بكسل)
+    if (found && (maxX - minX) > 10 && (maxY - minY) > 10) {
+      int pad = 10;
+      int cx = max(0, minX - pad);
+      int cy = max(0, minY - pad);
+      int cw = min(gray.width - cx, (maxX - minX) + 2 * pad);
+      int ch = min(gray.height - cy, (maxY - minY) + 2 * pad);
+      gray = img.copyCrop(gray, x: cx, y: cy, width: cw, height: ch);
     }
 
     img.Image resized = img.copyResize(gray, width: 224, height: 224);
     return Uint8List.fromList(img.encodePng(resized));
   }
 
-  Future<List<double>> _getEmbedding(File file) async {
-    Uint8List bytes = await _preprocess(file);
+  Future<List<double>> _getEmbedding(Uint8List processedBytes) async {
     List<double>? out = await _model!.getImagePredictionList(
-      bytes,
+      processedBytes,
       mean: [0.485, 0.456, 0.406],
       std: [0.229, 0.224, 0.225],
     );
@@ -132,8 +150,8 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
 
     setState(() => _isBusy = true);
     try {
-      File file = File(picked.path);
-      List<double> newEmb = await _getEmbedding(file);
+      Uint8List procBytes = await _preprocess(File(picked.path));
+      List<double> newEmb = await _getEmbedding(procBytes);
 
       if (index > 0) {
         List<List<double>> prevEmbs = [];
@@ -151,16 +169,17 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
           setState(() => _isBusy = false);
           _showAlert(
             "⚠️ إمضاء غير متطابق!",
-            "هذه الإمضاءة لا تشبه الإمضاءات السابقة!\nيرجى إعادة المحاولة وتوقيع إمضاءة مطابقة.",
+            "درجة التشابه: ${sim.toStringAsFixed(4)} (أقل من الحد المطلوب ${_threshold.toStringAsFixed(3)})\nيرجى توقيع إمضاءة مطابقة.",
           );
           return;
         }
       }
 
       setState(() {
-        _refImages[index] = file;
+        _refProcessed[index] = procBytes;
         _refEmbeddings[index] = newEmb;
         _accuracyPct = null;
+        _rawSimValue = null;
         _isBusy = false;
       });
     } catch (e) {
@@ -177,18 +196,29 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
     final picked = await _picker.pickImage(source: ImageSource.camera, imageQuality: 85);
     if (picked == null) return;
 
-    setState(() {
-      _testImage = File(picked.path);
-      _accuracyPct = null;
-    });
+    setState(() => _isBusy = true);
+    try {
+      File raw = File(picked.path);
+      Uint8List procBytes = await _preprocess(raw);
+      setState(() {
+        _testRawFile = raw;
+        _testProcessed = procBytes;
+        _accuracyPct = null;
+        _rawSimValue = null;
+        _isBusy = false;
+      });
+    } catch (e) {
+      setState(() => _isBusy = false);
+      _showAlert("خطأ", e.toString());
+    }
   }
 
   Future<void> _verifyFinal() async {
-    if (_testImage == null || _refEmbeddings.contains(null)) return;
+    if (_testProcessed == null || _refEmbeddings.contains(null)) return;
     setState(() => _isBusy = true);
 
     try {
-      List<double> testEmb = await _getEmbedding(_testImage!);
+      List<double> testEmb = await _getEmbedding(_testProcessed!);
       List<double> meanRef = List.generate(
         testEmb.length,
         (j) => (_refEmbeddings[0]![j] + _refEmbeddings[1]![j] + _refEmbeddings[2]![j]) / 3.0,
@@ -196,9 +226,11 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
       meanRef = _l2Normalize(meanRef);
 
       double rawSim = _cosineSim(meanRef, testEmb);
-      double score = (((rawSim - 0.70) / 0.30) * 100).clamp(0.0, 100.0);
+      // معايرة النسبة المئوية بحيث 0.90 = 0% و 1.00 = 100%
+      double score = (((rawSim - 0.90) / 0.10) * 100).clamp(0.0, 100.0);
 
       setState(() {
+        _rawSimValue = rawSim;
         _accuracyPct = score;
         _isSamePerson = rawSim >= _threshold;
         _isBusy = false;
@@ -212,11 +244,13 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
   void _resetAll() {
     setState(() {
       for (int i = 0; i < 3; i++) {
-        _refImages[i] = null;
+        _refProcessed[i] = null;
         _refEmbeddings[i] = null;
       }
-      _testImage = null;
+      _testProcessed = null;
+      _testRawFile = null;
       _accuracyPct = null;
+      _rawSimValue = null;
     });
   }
 
@@ -245,88 +279,112 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
         ],
       ),
       body: SingleChildScrollView(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.all(14),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             if (_loadError != null)
               Container(
-                padding: const EdgeInsets.all(12),
-                margin: const EdgeInsets.only(bottom: 12),
+                padding: const EdgeInsets.all(10),
                 color: Colors.red.shade100,
-                child: Text("خطأ في تحميل الموديل:\n$_loadError", style: const TextStyle(color: Colors.red)),
+                child: Text("خطأ: $_loadError", style: const TextStyle(color: Colors.red)),
               ),
-            if (_model == null && _loadError == null)
-              const Padding(
-                padding: EdgeInsets.only(bottom: 12),
-                child: Row(
+            // شريط ضبط حساسية الموديل لحظياً
+            Card(
+              color: Colors.indigo.shade50,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                child: Column(
                   children: [
-                    SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)),
-                    SizedBox(width: 10),
-                    Text("جاري تهيئة نموذج الذكاء الاصطناعي..."),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Text("حساسية القبول (Threshold):", style: TextStyle(fontWeight: FontWeight.bold)),
+                        Text(_threshold.toStringAsFixed(3), style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.indigo)),
+                      ],
+                    ),
+                    Slider(
+                      value: _threshold,
+                      min: 0.90,
+                      max: 0.999,
+                      divisions: 99,
+                      onChanged: (v) {
+                        setState(() {
+                          _threshold = v;
+                          if (_rawSimValue != null) {
+                            _isSamePerson = _rawSimValue! >= _threshold;
+                          }
+                        });
+                      },
+                    ),
                   ],
                 ),
               ),
-            const Text("1️⃣ تسجيل 3 إمضاءات متطابقة (المرجع):", style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
-            const SizedBox(height: 10),
+            ),
+            const SizedBox(height: 8),
+            const Text("1️⃣ تسجيل 3 إمضاءات متطابقة (معاينة AI):", style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 8),
             Row(
               children: List.generate(3, (i) {
                 return Expanded(
                   child: GestureDetector(
                     onTap: () => _captureReference(i),
                     child: Container(
-                      height: 115,
+                      height: 110,
                       margin: const EdgeInsets.symmetric(horizontal: 4),
                       decoration: BoxDecoration(
-                        border: Border.all(color: _refImages[i] != null ? Colors.green : Colors.indigo, width: 2),
+                        border: Border.all(color: _refProcessed[i] != null ? Colors.green : Colors.indigo, width: 2),
                         borderRadius: BorderRadius.circular(10),
-                        color: Colors.grey.shade100,
+                        color: Colors.black87,
                       ),
-                      child: _refImages[i] != null
-                          ? ClipRRect(borderRadius: BorderRadius.circular(8), child: Image.file(_refImages[i]!, fit: BoxFit.cover))
-                          : Column(
-                              mainAxisAlignment: MainAxisAlignment.center,
-                              children: [
-                                const Icon(Icons.camera_alt, color: Colors.indigo, size: 30),
-                                const SizedBox(height: 4),
-                                Text("إمضاء ${i + 1}", style: const TextStyle(fontWeight: FontWeight.bold)),
-                              ],
+                      child: _refProcessed[i] != null
+                          ? ClipRRect(borderRadius: BorderRadius.circular(8), child: Image.memory(_refProcessed[i]!, fit: BoxFit.contain))
+                          : Container(
+                              color: Colors.grey.shade100,
+                              child: Column(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                children: [
+                                  const Icon(Icons.camera_alt, color: Colors.indigo, size: 28),
+                                  const SizedBox(height: 4),
+                                  Text("إمضاء ${i + 1}", style: const TextStyle(fontWeight: FontWeight.bold)),
+                                ],
+                              ),
                             ),
                     ),
                   ),
                 );
               }),
             ),
-            const Divider(height: 30),
-            const Text("2️⃣ إمضاء الاختبار (للتحقق):", style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
-            const SizedBox(height: 10),
+            const Divider(height: 24),
+            const Text("2️⃣ إمضاء الاختبار (للتحقق):", style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 8),
             GestureDetector(
               onTap: _captureTest,
               child: Container(
-                height: 150,
+                height: 140,
                 decoration: BoxDecoration(
                   border: Border.all(color: Colors.deepOrange, width: 2),
                   borderRadius: BorderRadius.circular(12),
-                  color: Colors.grey.shade100,
+                  color: _testProcessed != null ? Colors.black87 : Colors.grey.shade100,
                 ),
-                child: _testImage != null
-                    ? ClipRRect(borderRadius: BorderRadius.circular(10), child: Image.file(_testImage!, fit: BoxFit.contain))
+                child: _testProcessed != null
+                    ? ClipRRect(borderRadius: BorderRadius.circular(10), child: Image.memory(_testProcessed!, fit: BoxFit.contain))
                     : const Column(
                         mainAxisAlignment: MainAxisAlignment.center,
                         children: [
-                          Icon(Icons.document_scanner, color: Colors.deepOrange, size: 42),
+                          Icon(Icons.document_scanner, color: Colors.deepOrange, size: 40),
                           SizedBox(height: 6),
-                          Text("اضغط لتصوير الإمضاء الرابع", style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                          Text("اضغط لتصوير الإمضاء الرابع", style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold)),
                         ],
                       ),
               ),
             ),
-            const SizedBox(height: 18),
+            const SizedBox(height: 14),
             if (_isBusy) const Center(child: CircularProgressIndicator()),
-            if (_accuracyPct != null)
+            if (_accuracyPct != null && _rawSimValue != null)
               Container(
-                padding: const EdgeInsets.all(16),
-                margin: const EdgeInsets.only(bottom: 14),
+                padding: const EdgeInsets.all(14),
+                margin: const EdgeInsets.only(bottom: 12),
                 decoration: BoxDecoration(
                   color: _isSamePerson! ? Colors.green.shade100 : Colors.red.shade100,
                   borderRadius: BorderRadius.circular(12),
@@ -336,19 +394,22 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
                   children: [
                     Text(
                       _isSamePerson! ? "✅ هو نفس الشخص (توقيع مطابق)" : "❌ شخص مختلف / توقيع مزور",
-                      style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                      style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
                     ),
-                    const SizedBox(height: 6),
-                    Text("نسبة التطابق: ${_accuracyPct!.toStringAsFixed(1)}%", style: const TextStyle(fontSize: 16)),
+                    const SizedBox(height: 4),
+                    Text(
+                      "نسبة التطابق: ${_accuracyPct!.toStringAsFixed(1)}%  (Raw: ${_rawSimValue!.toStringAsFixed(4)})",
+                      style: const TextStyle(fontSize: 15),
+                    ),
                   ],
                 ),
               ),
             SizedBox(
-              height: 52,
+              height: 50,
               child: ElevatedButton(
-                onPressed: (_testImage == null || _isBusy) ? null : _verifyFinal,
+                onPressed: (_testProcessed == null || _isBusy) ? null : _verifyFinal,
                 style: ElevatedButton.styleFrom(backgroundColor: Colors.indigo, foregroundColor: Colors.white),
-                child: const Text("🔍 تحقق من التوقيع الآن", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                child: const Text("🔍 تحقق من التوقيع الآن", style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
               ),
             ),
           ],
