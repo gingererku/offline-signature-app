@@ -30,8 +30,8 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
   double? _rawSimValue;
   bool? _isSamePerson;
 
-  // عتبة القبول بعد إلغاء الانحياز الموجب (افتراضياً 0.75)
-  double _threshold = 0.75;
+  // عتبة القبول المتوافقة مع الموديل الجديد (Best Threshold = 0.67)
+  double _threshold = 0.65;
 
   @override
   void initState() {
@@ -54,7 +54,6 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
     }
   }
 
-  // إظهار قائمة لاختيار الكاميرا أو المعرض (الجاليري)
   Future<ImageSource?> _chooseImageSource() async {
     return showModalBottomSheet<ImageSource>(
       context: context,
@@ -80,6 +79,43 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
     );
   }
 
+  // خوارزمية Otsu لعزل القلم الرفيع والحبر الرمادي بنفس دقة التدريب
+  int _computeOtsuThreshold(img.Image gray) {
+    List<int> hist = List.filled(256, 0);
+    int total = gray.width * gray.height;
+    for (var p in gray) {
+      hist[p.r.toInt().clamp(0, 255)]++;
+    }
+
+    double sumAll = 0;
+    for (int i = 0; i < 256; i++) {
+      sumAll += i * hist[i];
+    }
+
+    double sumB = 0;
+    int wB = 0;
+    double maxVar = 0;
+    int threshold = 128;
+
+    for (int t = 0; t < 256; t++) {
+      wB += hist[t];
+      if (wB == 0) continue;
+      int wF = total - wB;
+      if (wF == 0) break;
+
+      sumB += t * hist[t];
+      double mB = sumB / wB;
+      double mF = (sumAll - sumB) / wF;
+      double varBetween = wB.toDouble() * wF.toDouble() * (mB - mF) * (mB - mF);
+
+      if (varBetween > maxVar) {
+        maxVar = varBetween;
+        threshold = t;
+      }
+    }
+    return threshold;
+  }
+
   Future<Uint8List> _preprocess(File file) async {
     final bytes = await file.readAsBytes();
     img.Image? decoded = img.decodeImage(bytes);
@@ -99,13 +135,7 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
     );
 
     img.Image gray = img.grayscale(decoded);
-
-    int sum = 0;
-    for (var p in gray) {
-      sum += p.r.toInt();
-    }
-    int meanVal = (sum / (gray.width * gray.height)).toInt();
-    int thresh = (meanVal * 0.68).toInt();
+    int thresh = _computeOtsuThreshold(gray);
 
     int minX = gray.width, minY = gray.height, maxX = 0, maxY = 0;
     bool found = false;
@@ -148,7 +178,6 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
     return _centerAndNormalize(out!);
   }
 
-  // طرح المتوسط قبل التطبيع لإلغاء الانحياز الموجب وإظهار الفروق الحقيقية بين الإمضاءات
   List<double> _centerAndNormalize(List<double> v) {
     double mean = v.reduce((a, b) => a + b) / v.length;
     List<double> centered = v.map((x) => x - mean).toList();
