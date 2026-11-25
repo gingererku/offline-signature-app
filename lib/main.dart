@@ -23,7 +23,6 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
   final List<Uint8List?> _refProcessed = [null, null, null];
   final List<List<double>?> _refEmbeddings = [null, null, null];
   Uint8List? _testProcessed;
-  File? _testRawFile;
 
   final ImagePicker _picker = ImagePicker();
   bool _isBusy = false;
@@ -31,8 +30,8 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
   double? _rawSimValue;
   bool? _isSamePerson;
 
-  // عتبة قابلة للتعديل مباشرة من التطبيق (افتراضياً 0.96)
-  double _threshold = 0.96;
+  // عتبة القبول بعد إلغاء الانحياز الموجب (افتراضياً 0.75)
+  double _threshold = 0.75;
 
   @override
   void initState() {
@@ -55,6 +54,32 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
     }
   }
 
+  // إظهار قائمة لاختيار الكاميرا أو المعرض (الجاليري)
+  Future<ImageSource?> _chooseImageSource() async {
+    return showModalBottomSheet<ImageSource>(
+      context: context,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (ctx) => SafeArea(
+        child: Wrap(
+          children: [
+            ListTile(
+              leading: const Icon(Icons.camera_alt, color: Colors.indigo),
+              title: const Text("التقاط صورة بالكاميرا", style: TextStyle(fontWeight: FontWeight.bold)),
+              onTap: () => Navigator.pop(ctx, ImageSource.camera),
+            ),
+            ListTile(
+              leading: const Icon(Icons.photo_library, color: Colors.teal),
+              title: const Text("اختيار صورة من الجاليري", style: TextStyle(fontWeight: FontWeight.bold)),
+              onTap: () => Navigator.pop(ctx, ImageSource.gallery),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Future<Uint8List> _preprocess(File file) async {
     final bytes = await file.readAsBytes();
     img.Image? decoded = img.decodeImage(bytes);
@@ -62,9 +87,9 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
 
     decoded = img.bakeOrientation(decoded);
 
-    // 1. قص 12% من الحواف لتجاهل أطراف الورقة والظل الجانبي
-    int marginX = (decoded.width * 0.12).toInt();
-    int marginY = (decoded.height * 0.12).toInt();
+    // قص 10% من الحواف لتجاهل أطراف الورقة والظل الجانبي
+    int marginX = (decoded.width * 0.10).toInt();
+    int marginY = (decoded.height * 0.10).toInt();
     decoded = img.copyCrop(
       decoded,
       x: marginX,
@@ -75,7 +100,6 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
 
     img.Image gray = img.grayscale(decoded);
 
-    // 2. حساب متوسط الإضاءة وعزل الحبر الغامق فقط (تجاهل الظلال الخفيفة)
     int sum = 0;
     for (var p in gray) {
       sum += p.r.toInt();
@@ -90,19 +114,18 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
       for (int x = 0; x < gray.width; x++) {
         int val = gray.getPixel(x, y).r.toInt();
         if (val < thresh) {
-          gray.setPixelRgb(x, y, 255, 255, 255); // خط الإمضاء أبيض
+          gray.setPixelRgb(x, y, 255, 255, 255);
           if (x < minX) minX = x;
           if (x > maxX) maxX = x;
           if (y < minY) minY = y;
           if (y > maxY) maxY = y;
           found = true;
         } else {
-          gray.setPixelRgb(x, y, 0, 0, 0); // الخلفية سوداء
+          gray.setPixelRgb(x, y, 0, 0, 0);
         }
       }
     }
 
-    // 3. قص الإمضاء بدقة مع هامش أمان بسيط (10 بكسل)
     if (found && (maxX - minX) > 10 && (maxY - minY) > 10) {
       int pad = 10;
       int cx = max(0, minX - pad);
@@ -122,12 +145,15 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
       mean: [0.485, 0.456, 0.406],
       std: [0.229, 0.224, 0.225],
     );
-    return _l2Normalize(out!);
+    return _centerAndNormalize(out!);
   }
 
-  List<double> _l2Normalize(List<double> v) {
-    double norm = sqrt(v.fold(0.0, (s, x) => s + x * x));
-    return norm == 0 ? v : v.map((x) => x / norm).toList();
+  // طرح المتوسط قبل التطبيع لإلغاء الانحياز الموجب وإظهار الفروق الحقيقية بين الإمضاءات
+  List<double> _centerAndNormalize(List<double> v) {
+    double mean = v.reduce((a, b) => a + b) / v.length;
+    List<double> centered = v.map((x) => x - mean).toList();
+    double norm = sqrt(centered.fold(0.0, (s, x) => s + x * x));
+    return norm == 0 ? centered : centered.map((x) => x / norm).toList();
   }
 
   double _cosineSim(List<double> a, List<double> b) {
@@ -141,11 +167,14 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
   Future<void> _captureReference(int index) async {
     if (_model == null || _isBusy) return;
     if (index > 0 && _refEmbeddings[index - 1] == null) {
-      _showAlert("تنبيه", "يرجى تصوير الإمضاء رقم ${index} أولاً بالترتيب.");
+      _showAlert("تنبيه", "يرجى إدخال الإمضاء رقم ${index} أولاً بالترتيب.");
       return;
     }
 
-    final picked = await _picker.pickImage(source: ImageSource.camera, imageQuality: 85);
+    final source = await _chooseImageSource();
+    if (source == null) return;
+
+    final picked = await _picker.pickImage(source: source, imageQuality: 85);
     if (picked == null) return;
 
     setState(() => _isBusy = true);
@@ -162,14 +191,14 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
           newEmb.length,
           (j) => prevEmbs.map((e) => e[j]).reduce((a, b) => a + b) / prevEmbs.length,
         );
-        meanPrev = _l2Normalize(meanPrev);
+        meanPrev = _centerAndNormalize(meanPrev);
 
         double sim = _cosineSim(meanPrev, newEmb);
         if (sim < _threshold) {
           setState(() => _isBusy = false);
           _showAlert(
             "⚠️ إمضاء غير متطابق!",
-            "درجة التشابه: ${sim.toStringAsFixed(4)} (أقل من الحد المطلوب ${_threshold.toStringAsFixed(3)})\nيرجى توقيع إمضاءة مطابقة.",
+            "درجة التشابه: ${sim.toStringAsFixed(3)} (أقل من الحد المطلوب ${_threshold.toStringAsFixed(2)})\nيرجى اختيار إمضاءة مطابقة.",
           );
           return;
         }
@@ -193,15 +222,17 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
       _showAlert("تنبيه", "أكمل تسجيل الإمضاءات المرجعية الثلاثة أولاً.");
       return;
     }
-    final picked = await _picker.pickImage(source: ImageSource.camera, imageQuality: 85);
+
+    final source = await _chooseImageSource();
+    if (source == null) return;
+
+    final picked = await _picker.pickImage(source: source, imageQuality: 85);
     if (picked == null) return;
 
     setState(() => _isBusy = true);
     try {
-      File raw = File(picked.path);
-      Uint8List procBytes = await _preprocess(raw);
+      Uint8List procBytes = await _preprocess(File(picked.path));
       setState(() {
-        _testRawFile = raw;
         _testProcessed = procBytes;
         _accuracyPct = null;
         _rawSimValue = null;
@@ -223,11 +254,10 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
         testEmb.length,
         (j) => (_refEmbeddings[0]![j] + _refEmbeddings[1]![j] + _refEmbeddings[2]![j]) / 3.0,
       );
-      meanRef = _l2Normalize(meanRef);
+      meanRef = _centerAndNormalize(meanRef);
 
       double rawSim = _cosineSim(meanRef, testEmb);
-      // معايرة النسبة المئوية بحيث 0.90 = 0% و 1.00 = 100%
-      double score = (((rawSim - 0.90) / 0.10) * 100).clamp(0.0, 100.0);
+      double score = (rawSim * 100).clamp(0.0, 100.0);
 
       setState(() {
         _rawSimValue = rawSim;
@@ -248,7 +278,6 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
         _refEmbeddings[i] = null;
       }
       _testProcessed = null;
-      _testRawFile = null;
       _accuracyPct = null;
       _rawSimValue = null;
     });
@@ -289,7 +318,6 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
                 color: Colors.red.shade100,
                 child: Text("خطأ: $_loadError", style: const TextStyle(color: Colors.red)),
               ),
-            // شريط ضبط حساسية الموديل لحظياً
             Card(
               color: Colors.indigo.shade50,
               child: Padding(
@@ -300,14 +328,14 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
                         const Text("حساسية القبول (Threshold):", style: TextStyle(fontWeight: FontWeight.bold)),
-                        Text(_threshold.toStringAsFixed(3), style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.indigo)),
+                        Text(_threshold.toStringAsFixed(2), style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.indigo)),
                       ],
                     ),
                     Slider(
                       value: _threshold,
-                      min: 0.90,
-                      max: 0.999,
-                      divisions: 99,
+                      min: 0.40,
+                      max: 0.99,
+                      divisions: 59,
                       onChanged: (v) {
                         setState(() {
                           _threshold = v;
@@ -322,7 +350,7 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
               ),
             ),
             const SizedBox(height: 8),
-            const Text("1️⃣ تسجيل 3 إمضاءات متطابقة (معاينة AI):", style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+            const Text("1️⃣ تسجيل 3 إمضاءات متطابقة (كاميرا أو جاليري):", style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
             const SizedBox(height: 8),
             Row(
               children: List.generate(3, (i) {
@@ -344,7 +372,7 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
                               child: Column(
                                 mainAxisAlignment: MainAxisAlignment.center,
                                 children: [
-                                  const Icon(Icons.camera_alt, color: Colors.indigo, size: 28),
+                                  const Icon(Icons.add_a_photo, color: Colors.indigo, size: 28),
                                   const SizedBox(height: 4),
                                   Text("إمضاء ${i + 1}", style: const TextStyle(fontWeight: FontWeight.bold)),
                                 ],
@@ -374,7 +402,7 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
                         children: [
                           Icon(Icons.document_scanner, color: Colors.deepOrange, size: 40),
                           SizedBox(height: 6),
-                          Text("اضغط لتصوير الإمضاء الرابع", style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold)),
+                          Text("اضغط لاختيار أو تصوير الإمضاء الرابع", style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold)),
                         ],
                       ),
               ),
