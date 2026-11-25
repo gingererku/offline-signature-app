@@ -14,7 +14,7 @@ jobs:
         with:
           flutter-version: "3.24.0"
       - name: Initialize Android project files
-        run: flutter create . --platforms=android
+        run: flutter create . --platforms=android --project-name offline_signature_app
       - name: Enable camera permission
         run: |
           sed -i 's/<application/<uses-permission android:name="android.permission.CAMERA"\/>\n    <application/' android/app/src/main/AndroidManifest.xml
