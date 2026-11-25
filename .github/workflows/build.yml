@@ -12,7 +12,7 @@ jobs:
           java-version: "17"
       - uses: subosito/flutter-action@v2
         with:
-          flutter-version: "3.24.0"
+          flutter-version: "3.27.4"
       - name: Initialize Android project files
         run: flutter create . --platforms=android --project-name offline_signature_app
       - name: Enable camera permission
