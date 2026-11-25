@@ -18,7 +18,7 @@ class OfflineSignatureApp extends StatefulWidget {
 }
 
 class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
-  CustomModel? _model;
+  ClassificationModel? _model;
   final List<File?> _refImages = [null, null, null];
   final List<List<double>?> _refEmbeddings = [null, null, null];
   File? _testImage;
@@ -38,7 +38,12 @@ class _OfflineSignatureAppState extends State<OfflineSignatureApp> {
   }
 
   Future<void> _loadModel() async {
-    _model = await PytorchLite.loadCustomModel("assets/signature_mobile.ptl");
+    _model = await PytorchLite.loadClassificationModel(
+      "assets/signature_mobile.ptl",
+      224,
+      224,
+      128,
+    );
     setState(() {});
   }
 
