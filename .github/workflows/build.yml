@@ -15,11 +15,21 @@ jobs:
           flutter-version: '3.27.4'
       - name: Initialize Android project files
         run: flutter create . --platforms=android --project-name offline_signature_app
-      - name: Enable camera permission
+      - name: Enable camera permission and keep PyTorch classes
         run: |
           sed -i 's/<application/<uses-permission android:name="android.permission.CAMERA"\/>\n    <application/' android/app/src/main/AndroidManifest.xml
+          cat << 'EOF' > android/app/proguard-rules.pro
+          -keep class org.pytorch.** { *; }
+          -keepclassmembers class org.pytorch.** { *; }
+          -dontwarn org.pytorch.**
+          EOF
+          if [ -f android/app/build.gradle.kts ]; then
+            sed -i 's/release {/release {\n            isMinifyEnabled = false\n            isShrinkResources = false\n            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")/' android/app/build.gradle.kts
+          else
+            sed -i 's/release {/release {\n            minifyEnabled false\n            shrinkResources false\n            proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"/' android/app/build.gradle
+          fi
       - name: Build APK
-        run: flutter build apk --release --no-shrink
+        run: flutter build apk --release
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
